@@ -25,7 +25,3 @@ data/
 output/
 models/
 images/
-
-# 기타 폴더 (필요에 따라 추가)
-others/
-notebooks/ # 주피터 노트북은 충돌이 잦아 제외하거나, 신중하게 관리하는 것을 추천
