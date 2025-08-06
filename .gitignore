@@ -1,0 +1,31 @@
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+ENV/
+env/
+
+# --- Jupyter Notebook ---
+.ipynb_checkpoints
+
+# --- OS-specific ---
+.DS_Store
+Thumbs.db
+
+# --- IDE ---
+.vscode/
+.idea/
+
+# --- Project-specific (매우 중요) ---
+# 용량이 큰 데이터 폴더는 절대 올리지 않습니다.
+data/
+
+# 실행 결과물 및 생성된 파일들
+output/
+models/
+images/
+
+# 기타 폴더 (필요에 따라 추가)
+others/
+notebooks/ # 주피터 노트북은 충돌이 잦아 제외하거나, 신중하게 관리하는 것을 추천
