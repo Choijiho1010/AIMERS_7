@@ -1,71 +1,112 @@
 # modeling.py
 
 import os
-import joblib # 모델 저장을 위한 라이브러리
-import lightgbm as lgb
-from tqdm import tqdm
+import joblib
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, List, Tuple
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
+from sklearn.pipeline import Pipeline
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from xgboost import XGBRegressor
+import config
 
 class ModelTrainer:
-    def __init__(self, model_settings, model_dir):
-        self.settings = model_settings
+    def __init__(self, models: Dict, model_dir: str):
+        self.models = models
         self.model_dir = model_dir
-        self.models = {} # 학습된 모델 객체를 저장할 딕셔너리
-        
-        # 모델 저장 디렉토리 생성
-        os.makedirs(self.model_dir, exist_ok=True)
-        print(f"모델이 저장될 디렉토리: {self.model_dir}")
+        self.best_model_name = 'XGBoost_MultiOutput'
+        self.X_train = None
+        self.y_train = None
+        self.model = None
 
-    def _get_model_instance(self, model_name):
-        """설정에 따라 모델 인스턴스를 생성하는 내부 함수"""
-        model_config = self.settings.get(model_name)
-        if not model_config:
-            raise ValueError(f"{model_name}에 대한 설정이 config.py에 없습니다.")
-
-        if model_name == 'LightGBM':
-            return lgb.LGBMRegressor(**model_config['model_params'])
-        # elif model_name == 'XGBoost':
-        #     return xgb.XGBRegressor(...) # 추후 확장 가능
+    def _get_model_instance(self, model_name: str, model_params: Dict) -> Any:
+        if model_name == 'XGBoost_MultiOutput':
+            categorical_features = config.CATEGORICAL_FEATURES
+            numerical_features = [
+                'x', 'y'
+            ] + [f'lag_{l}' for l in range(1, config.LAGS + 1)]
+            
+            preprocessor = ColumnTransformer(
+                transformers=[
+                    ('onehot', OneHotEncoder(handle_unknown='ignore'), categorical_features),
+                    ('num', 'passthrough', numerical_features)
+                ],
+                remainder='drop'
+            )
+            base_model = XGBRegressor(**model_params)
+            
+            return Pipeline(steps=[
+                ('preprocessor', preprocessor),
+                ('multi_output_regressor', MultiOutputRegressor(base_model, n_jobs=config.N_JOBS))
+            ])
         else:
             raise ValueError(f"지원하지 않는 모델입니다: {model_name}")
+    
+    def _time_based_split(self, X: pd.DataFrame, y: pd.DataFrame, valid_days: int) -> Tuple[List[int], List[int]]:
+        cutoff = X['ref_date'].max() - pd.Timedelta(days=valid_days)
+        train_idx = X[X['ref_date'] <= cutoff].index.tolist()
+        val_idx = X[X['ref_date'] > cutoff].index.tolist()
+        return train_idx, val_idx
 
-    def fit(self, X, y):
-        """config에 명시된 모든 모델을 학습하고 저장합니다."""
-        print("--- 모델 학습 시작 ---")
-        for model_name in tqdm(self.settings.keys()):
-            print(f"\n모델 학습 중: {model_name}")
-            
-            # 1. 모델 인스턴스 생성
-            model = self._get_model_instance(model_name)
-            
-            # 2. 모델 학습
-            model.fit(X, y)
-            
-            # 3. 학습된 모델을 딕셔너리와 파일로 저장
-            self.models[model_name] = model
-            model_path = os.path.join(self.model_dir, f"{model_name}.pkl")
-            joblib.dump(model, model_path)
-            print(f"{model_name} 모델이 {model_path}에 저장되었습니다.")
-            
-        print("--- 모든 모델 학습 완료 ---")
-        return self.models
+    def validate(self, X_raw: pd.DataFrame, y: pd.DataFrame):
+        print("\n--- 교차 검증 시작 ---")
+        model_name = self.best_model_name
+        model_info = self.models[model_name]
+        
+        X_data = X_raw.drop(columns=['ref_date'], errors='ignore')
+        y_data = y
+        
+        train_idx, val_idx = self._time_based_split(X_raw, y, valid_days=config.VALIDATION_SETTINGS['valid_days'])
+        
+        X_train, X_val = X_data.loc[train_idx], X_data.loc[val_idx]
+        y_train, y_val = y_data.loc[train_idx], y_data.loc[val_idx]
+        
+        self.model = self._get_model_instance(model_name, model_info['model_params'])
+        self.model.fit(X_train, y_train)
 
-    def predict(self, X):
-        """저장된 모든 모델을 불러와 예측을 수행합니다."""
-        print("--- 예측 시작 ---")
-        predictions = {}
-        for model_name in tqdm(self.settings.keys()):
-            print(f"\n모델 예측 중: {model_name}")
+        preds = self.model.predict(X_val)
+        rmse = ((preds - y_val.values) ** 2).mean(axis=0) ** 0.5
+        
+        print("[Validation] RMSE per horizon:", rmse.round(2))
+        
+        self.X_train = X_data.loc[train_idx]
+        self.y_train = y_data.loc[train_idx]
+        
+        print("\n--- 교차 검증 완료 ---")
+
+    def fit_and_save(self, X: pd.DataFrame, y: pd.DataFrame):
+        print("\n--- 전체 데이터 학습 시작 ---")
+        
+        model_name = self.best_model_name
+        model_info = self.models[model_name]
+        
+        if self.model is None:
+            self.model = self._get_model_instance(model_name, model_info['model_params'])
             
-            # 1. 저장된 모델 불러오기
-            model_path = os.path.join(self.model_dir, f"{model_name}.pkl")
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(f"{model_path}에서 모델을 찾을 수 없습니다. fit을 먼저 실행하세요.")
-            
-            loaded_model = joblib.load(model_path)
-            
-            # 2. 예측 수행
-            preds = loaded_model.predict(X)
-            predictions[model_name] = preds
-            
-        print("--- 모든 모델 예측 완료 ---")
-        return predictions
+        X_fit = X.drop(columns=['ref_date', 'is_filtered'], errors='ignore')
+        
+        self.model.fit(X_fit, y)
+        
+        os.makedirs(self.model_dir, exist_ok=True)
+        model_path = os.path.join(self.model_dir, f'{model_name}.pkl')
+        joblib.dump(self.model, model_path)
+        print(f"모델 '{model_name}'이 '{model_path}'에 저장되었습니다.")
+        print("--- 전체 데이터 학습 완료 ---")
+
+    def predict(self, X_test: pd.DataFrame) -> np.ndarray:
+        model_name = self.best_model_name
+        model_path = os.path.join(self.model_dir, f'{model_name}.pkl')
+        model = joblib.load(model_path)
+        
+        X_predict = X_test.drop(columns=['ref_date', 'is_filtered'], errors='ignore')
+        
+        preds = model.predict(X_predict)
+        
+        if preds.ndim == 1:
+            preds = preds.reshape(1, -1)
+        
+        return preds

@@ -1,141 +1,164 @@
 # preprocessing.py
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-import holidays
-import itertools
 
+import pandas as pd
+import numpy as np
+import itertools
+from tqdm import tqdm
+from datetime import timedelta
+import config
+from typing import List, Dict, Any, Tuple
+
+# [수정] read_data 함수를 그대로 옮겨옴
+def read_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required = {'영업일자', '영업장명_메뉴명', '매출수량'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"입력 파일에 필요한 컬럼이 없습니다: {missing}")
+    df['영업일자'] = pd.to_datetime(df['영업일자'])
+    if df['매출수량'].isna().any():
+        df['매출수량'] = df['매출수량'].fillna(0)
+    return df
 
 class Preprocessor:
-    def __init__(self, feature_settings):
-        self.feature_settings = feature_settings
+    def __init__(self, store_xy_map: dict, thr: int):
+        self.store_xy_map = store_xy_map
+        self.thr = thr
         self.all_items_ = None
-    
-    def fit(self, df):
-        print("--- Preprocessor fit 시작 ---")
+        self.lags_ = [f'lag_{l}' for l in range(1, config.LAGS + 1)]
+
+    def fit(self, df: pd.DataFrame):
         self.all_items_ = df['영업장명_메뉴명'].unique()
-        print(f"총 {len(self.all_items_)}개의 고유 품목을 학습했습니다.")
-        print("--- Preprocessor fit 완료 ---")
         return self
 
-    def transform(self, df):
-        print("--- 1차 전처리(피처 생성) 시작 ---")
-        processed_df = self._create_complete_dataframe(df)
-        processed_df = self._create_calendar_features(processed_df)
+    def transform(self, df: pd.DataFrame):
+        df = df.copy()
         
-        print("Lag/Rolling 피처 생성 중...")
-        processed_df = self._create_lag_features(processed_df)
-        processed_df = self._create_rolling_window_features(processed_df)
+        # 1. 데이터 클리닝 및 날짜 피처 생성
+        df.drop_duplicates(subset=['영업장명_메뉴명', '영업일자'], keep='last', inplace=True)
+        df['영업일자'] = pd.to_datetime(df['영업일자'])
+        df['dow'] = df['영업일자'].dt.dayofweek
+        df['month'] = df['영업일자'].dt.month
+        
+        # 2. 영업장명/메뉴명 분리 및 공간(좌표) 피처 추가
+        df = self._create_spatial_features(df)
+        
+        # 3. Lag 피처 추가
+        for lag in range(1, config.LAGS + 1):
+            df[f'lag_{lag}'] = df.groupby('영업장명_메뉴명')['매출수량'].shift(lag)
 
-        print("--- 1차 전처리(피처 생성) 완료 ---")
-        return processed_df
+        return df
 
-    def fit_transform(self, df):
+    def fit_transform(self, df: pd.DataFrame):
         self.fit(df)
         return self.transform(df)
-
-    def _create_complete_dataframe(self, df):
-        """
-        각 품목별로 데이터의 시작일부터 종료일까지 모든 날짜 행을 생성하고,
-        판매 기록이 없는 날은 0으로 채워넣어 데이터의 연속성을 보장합니다.
-        """
-        # (품목, 날짜) 조합의 중복이 있을 경우를 대비한 안전장치
-        df.drop_duplicates(subset=['영업장명_메뉴명', '영업일자'], keep='last', inplace=True)
-        
-        # '영업일자' 컬럼을 날짜 타입으로 변환
-        df['영업일자'] = pd.to_datetime(df['영업일자'])
-        
-        # 데이터의 전체 시작일과 종료일 확인
-        start_date, end_date = df['영업일자'].min(), df['영업일자'].max()
-        all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
-        
-        # fit() 단계에서 학습한 전체 품목 리스트 사용
-        if self.all_items_ is None:
-            raise RuntimeError("Preprocessor가 아직 fit되지 않았습니다. fit을 먼저 실행하세요.")
-        
-        # (모든 품목 x 모든 날짜) 조합의 데이터 '틀' 생성
-        multi_index = pd.MultiIndex.from_product([self.all_items_, all_dates], names=['영업장명_메뉴명', '영업일자'])
-        
-        # 원본 데이터를 '틀'에 맞게 재정렬
-        df_reindexed = df.set_index(['영업장명_메뉴명', '영업일자']).reindex(multi_index).reset_index()
-        
-        # 빠진 날짜의 매출수량은 0으로 채움
-        df_reindexed['매출수량'] = df_reindexed['매출수량'].fillna(0).astype(int)
-
-        # 빠진 날짜의 영업장명, 메뉴명 정보 채우기
-        split_data = df_reindexed['영업장명_메뉴명'].str.split('_', n=1, expand=True)
-        df_reindexed['영업장명'], df_reindexed['메뉴명'] = split_data[0], split_data[1]
-        
-        # ffill()을 사용하여 빈 영업장명, 메뉴명을 바로 윗 행의 값으로 채움
-        df_reindexed['영업장명'] = df_reindexed['영업장명'].ffill()
-        df_reindexed['메뉴명'] = df_reindexed['메뉴명'].ffill()
-        
-        return df_reindexed
-
-    def _create_calendar_features(self, df):
-        # [수정] 공휴일 피처 생성 로직 추가
-        kr_holidays = holidays.KR()
-        df['is_holiday'] = df['영업일자'].apply(lambda x: 1 if x in kr_holidays or x.weekday() >= 5 else 0)
-        df['holiday_block'] = (df['is_holiday'] != df['is_holiday'].shift()).cumsum()
-        df['block_size'] = df.groupby('holiday_block')['is_holiday'].transform('size')
-        df['consecutive_holidays'] = df['block_size'] * df['is_holiday']
-        df.drop(columns=['holiday_block', 'block_size'], inplace=True)
-        
-        # 기존 날짜 피처 생성
-        date_features_config = self.feature_settings.get('date_features', [])
-        for feature in date_features_config:
-            if feature == 'dayofweek': df['dayofweek'] = df['영업일자'].dt.dayofweek
-            elif feature == 'month': df['month'] = df['영업일자'].dt.month
-            elif feature == 'weekofyear': df['weekofyear'] = df['영업일자'].dt.isocalendar().week.astype(int)
-        return df
-
-    def _create_lag_features(self, df):
-        lags = self.feature_settings.get('lags', [])
-        for lag in lags:
-            df[f'sales_lag_{lag}'] = df.groupby('영업장명_메뉴명')['매출수량'].shift(lag)
-        return df
-
-    def _create_rolling_window_features(self, df):
-        windows = self.feature_settings.get('rolling_windows', [])
-        for window in windows:
-            rolling_series = df.groupby('영업장명_메뉴명')['매출수량'].shift(1).rolling(window)
-            df[f'sales_rolling_mean_{window}'] = rolling_series.mean()
-            df[f'sales_rolling_std_{window}'] = rolling_series.std()
-        return df
-
-
-
-def create_sliding_window_samples(processed_df, config):
-    print("--- 2차 전처리(Tabular 변환) 시작 ---")
     
-    horizon = config.OUTPUT_DAYS
-    lag_cols = [f'sales_lag_{l}' for l in config.FEATURE_ENGINEERING['lags']]
+    def _create_spatial_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df[['영업장명', '메뉴명']] = df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
+        df['x'] = df['영업장명'].map(lambda s: self.store_xy_map.get(s, (np.nan, np.nan))[0])
+        df['y'] = df['영업장명'].map(lambda s: self.store_xy_map.get(s, (np.nan, np.nan))[1])
+        df = df.drop(columns=['영업장명', '메뉴명'])
+        return df
 
+# =================================================================
+# 2차 전처리: Tabular 변환 (노트북 로직과 동일)
+# =================================================================
+def create_sliding_window_samples(
+    df: pd.DataFrame,
+    lags: int,
+    horizon: int,
+    train_mode: bool,
+    thr: int
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    
     X_rows, y_rows = [], []
 
-    for item_name, grp in tqdm(processed_df.groupby('영업장명_메뉴명'), desc="Sliding Window Generation"):
-        threshold = config.ITEM_SPECIFIC_ZERO_RUN_THRESHOLDS.get(item_name, config.DEFAULT_ZERO_RUN_THRESHOLD)
+    for key, grp in tqdm(df.groupby('영업장명_메뉴명'), desc='window'):
+        # [수정] _ensure_daily_continuity 함수로 보내기 전에 필요한 컬럼들을 추가
+        grp_for_continuity = grp.copy()
+        grp_for_continuity[['영업장명', '메뉴명']] = grp_for_continuity['영업장명_메뉴명'].str.split('_', n=1, expand=True)
         
-        # [수정] for 루프 범위 +1
-        for i in range(len(grp) - horizon + 1):
-            features = grp.iloc[[i]]
-            target = grp['매출수량'].iloc[i+1 : i+1+horizon]
-            
-            lag_values = features[lag_cols].values.flatten()
-            if np.all(lag_values == 0): continue
-            
-            zero_runs = [len(list(g)) for v, g in itertools.groupby(lag_values) if v == 0]
-            max_zero_run = max(zero_runs, default=0)
-            
-            if max_zero_run >= threshold: continue
+        g = _ensure_daily_continuity(grp_for_continuity)
+        sales = g['매출수량'].values
+        dates = g['영업일자']
+        
+        # [수정] _ensure_daily_continuity 내부에서 'x', 'y' 컬럼을 생성하도록 변경
+        # 이 부분을 Preprocessor 클래스에서 이미 처리했으므로, 해당 로직을 제거
+        
+        if len(sales) < lags:
+            continue
+        
+        # 위치 피처도 연속성을 위해 ffill/bfill로 채워야 함
+        g['x'] = g['영업장명'].map(lambda s: config.STORE_XY.get(s, (np.nan, np.nan))[0]).ffill().bfill()
+        g['y'] = g['영업장명'].map(lambda s: config.STORE_XY.get(s, (np.nan, np.nan))[1]).ffill().bfill()
 
-            X_rows.append(features)
-            y_rows.append(target.values)
 
-    X = pd.concat(X_rows, ignore_index=True)
-    y = pd.DataFrame(y_rows, columns=[f't+{h+1}' for h in range(horizon)])
+        if train_mode:
+            for i in range(lags, len(sales) - horizon + 1):
+                lag_block = sales[i - lags:i][::-1]
+                target = sales[i:i + horizon]
+                
+                max_zero_run_val = _max_zero_run(lag_block)
+                if max_zero_run_val >= thr:
+                    continue
+                
+                ref_date = dates.iloc[i]
+                
+                X_row = {
+                    '영업장명_메뉴명': key,
+                    'dow': int(ref_date.dayofweek),
+                    'month': int(ref_date.month),
+                    'ref_date': ref_date,
+                    'x': g.iloc[i]['x'],
+                    'y': g.iloc[i]['y'],
+                }
+                for l in range(1, lags + 1):
+                    X_row[f'lag_{l}'] = float(lag_block[l - 1])
+
+                X_rows.append(X_row)
+                y_rows.append(target)
+        else:
+            lag_block = sales[-lags:][::-1]
+            last_date = dates.iloc[-1]
+            ref_date = last_date + timedelta(days=1)
+            
+            max_zero_run_val = _max_zero_run(lag_block)
+            is_filtered = (max_zero_run_val >= thr)
+
+            X_row = {
+                '영업장명_메뉴명': key,
+                'dow': int(ref_date.dayofweek),
+                'month': int(ref_date.month),
+                'ref_date': ref_date,
+                'x': g.iloc[-1]['x'],
+                'y': g.iloc[-1]['y'],
+                'is_filtered': is_filtered,
+            }
+            for l in range(1, lags + 1):
+                X_row[f'lag_{l}'] = float(lag_block[l - 1])
+
+            X_rows.append(X_row)
     
-    print(f"--- 2차 전처리(Tabular 변환) 완료 ---")
-    print(f"생성된 X shape: {X.shape}, y shape: {y.shape}")
-    
-    return X, y
+    X = pd.DataFrame(X_rows)
+
+    if train_mode:
+        y_cols = [f't+{h}' for h in range(1, horizon + 1)]
+        y = pd.DataFrame(y_rows, columns=y_cols)
+        assert 'ref_date' in X.columns
+        return X, y
+    else:
+        return X, pd.DataFrame()
+
+# 노트북에 있던 보조 함수들
+def _ensure_daily_continuity(grp: pd.DataFrame) -> pd.DataFrame:
+    g = grp.set_index('영업일자').sort_index()
+    g = g.asfreq('D')
+    for col in ['영업장명_메뉴명', '영업장명', '메뉴명']:
+        g[col] = g[col].ffill().bfill()
+    g['매출수량'] = g['매출수량'].fillna(0)
+    g = g.reset_index().rename(columns={'index': '영업일자'})
+    return g
+
+def _max_zero_run(arr):
+    runs = (len(list(g)) for v, g in itertools.groupby(arr) if v == 0.0)
+    return max(runs, default=0)
