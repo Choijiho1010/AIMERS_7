@@ -4,6 +4,9 @@ import pandas as pd
 import numpy as np
 import os
 import config
+from sqlalchemy import create_engine, text
+import json
+
 
 def save_submission(predictions_df: pd.DataFrame, file_name: str = "submission.csv"):
     """
@@ -28,3 +31,43 @@ def save_submission(predictions_df: pd.DataFrame, file_name: str = "submission.c
     out_path = os.path.join(config.SUBMISSION_DIR, file_name)
     final_df.to_csv(out_path, index=False, encoding='utf-8-sig')
     print(f"제출 파일이 '{out_path}'에 저장되었습니다.")
+
+
+def connect_db():
+
+    with open("db_info.json") as f:
+        db_info = json.load(f)
+
+    user = db_info["user"]
+    password = db_info["password"]
+    host = db_info["host"]
+    port = db_info["port"]
+    schema = db_info["schema"]
+
+    engine = None
+
+    try:
+        engine = create_engine(f"mysql+pymysql://{user}:{password}@{host}:{port}/{schema}")
+    except Exception as e:
+        print(f'fail to connect db:{e}') 
+
+
+    return engine
+    
+
+def df2db(engine, df, name, if_exist = 'replace', index = False):
+    df.to_sql(
+        name = name,             # RDS에 생성할 테이블 이름
+        con = engine,
+        if_exist= if_exist,     # 'replace': 기존 테이블 덮어쓰기, 'append': 이어쓰기
+        index = index           # DataFrame의 인덱스를 테이블에 포함하지 않음
+    )
+    print("DataFrame successfully uploaded to RDS.")
+
+
+def db2df(engine, sql):
+    with engine.connect() as conn:
+        df = pd.read_sql(text(sql), conn)
+
+    return df
+

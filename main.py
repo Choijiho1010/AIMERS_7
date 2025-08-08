@@ -7,14 +7,32 @@ import config
 import os
 import glob
 import joblib
+import utils
 from tqdm import tqdm
 # [수정] read_data와 _max_zero_run 함수를 preprocessing에서 임포트
 from preprocessing import Preprocessor, create_sliding_window_samples, read_data
 from modeling import ModelTrainer
-from utils import save_submission
 from sklearn.metrics import mean_absolute_error
 
+
+
 def main(args):
+
+    # ++++++++++++++++++ DB 연결 필요시 +++++++++++++++
+    # engine = utils.connect_db()
+
+    # # train 불러오기
+    # sql = 'SELECT * FROM train'
+    # train = utils.db2df(engine, sql)
+
+    # # test 불러오기
+    # test_list = []
+    # for i in range(10):
+    #     sql = f'SELECT * FROM TEST_0{i}'
+    #     test = utils.db2df(engine, sql)
+    #     test_list.append(test)
+    
+    # +++++++++++++++++++++++++++++++++++++++++++++
     
     if args.mode == 'train':
         print("--- 학습 모드 시작 ---")
@@ -62,6 +80,7 @@ def main(args):
         for test_file in tqdm(test_files, desc="Test 파일별 예측 진행"):
             # [수정] read_data 함수를 import해서 사용
             test_df = read_data(test_file)
+        # for test_df in test_list:
             
             X_test, _ = create_sliding_window_samples(
                 preprocessor.transform(test_df),

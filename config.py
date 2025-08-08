@@ -14,6 +14,7 @@ DATA_DIR = os.path.join(BASE_DIR, 'data')
 MODEL_DIR = os.path.join(BASE_DIR, 'models')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 SUBMISSION_DIR = os.path.join(OUTPUT_DIR, 'submissions')
+DB_INFO_DIR = os.path.join('../',BASE_DIR)
 
 # --- 데이터 경로 ---
 TRAIN_CSV_PATH = os.path.join(DATA_DIR, 'train', 'train.csv')
