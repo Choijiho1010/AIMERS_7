@@ -27,7 +27,9 @@ class ModelTrainer:
     def _get_model_instance(self, model_name: str, model_params: Dict) -> Any:
         if model_name == 'XGBoost_MultiOutput':
             categorical_features = config.CATEGORICAL_FEATURES
-            numerical_features = [f'lag_{l}' for l in range(1, config.LAGS + 1)]
+            numerical_features = [
+                'x', 'y'
+            ] + [f'lag_{l}' for l in range(1, config.LAGS + 1)]
             
             preprocessor = ColumnTransformer(
                 transformers=[
@@ -99,37 +101,8 @@ class ModelTrainer:
             
         self.X_train = X_data.loc[train_idx]
         self.y_train = y_data.loc[train_idx]
-        print("\n--- 교차 검증 완료 ---")
-
-
-        # === 덤프 저장: holdout 예측 vs 실제 ===
-        dump_dir = os.path.join(self.model_dir, "outputs")
-        os.makedirs(dump_dir, exist_ok=True)
-
-        # y_val, preds -> long
-        yv = pd.DataFrame(y_val.values, index=y_val.index)
-        pr = pd.DataFrame(preds, index=y_val.index)
-        yv.columns = [f"t+{i}" for i in range(1, pr.shape[1] + 1)]
-        pr.columns = yv.columns
-
-        meta = X_raw.loc[y_val.index, ['영업장명_메뉴명', 'ref_date']].copy()
-        meta['store'] = meta['영업장명_메뉴명'].astype(str).str.split('_', n=1).str[0]
-        meta['menu']  = meta['영업장명_메뉴명'].astype(str).str.split('_', n=1).str[1]
-
-        yv_long = yv.reset_index(drop=True).melt(var_name='h', value_name='actual')
-        pr_long = pr.reset_index(drop=True).melt(var_name='h', value_name='pred')
-        meta_rep = pd.concat([meta.reset_index(drop=True)] * (pr.shape[1]), axis=0, ignore_index=True)
-
-        out = pd.concat([meta_rep, yv_long['h'], yv_long['actual'], pr_long['pred']], axis=1)
-        out['h'] = out['h'].str.replace('t+', '', regex=False).astype(int)
-        out['pred_date'] = pd.to_datetime(out['ref_date']) + pd.to_timedelta(out['h'] - 1, unit='D')
-        out['split'] = 'holdout'
-
-        out_path = os.path.join(dump_dir, "holdout_predictions.csv")
-        out.to_csv(out_path, index=False, encoding='utf-8-sig')
-        print(f"[Dump] Holdout predictions saved → {out_path}")
-
         
+        print("\n--- 교차 검증 완료 ---")
 
     def get_model_factory(self):
         # Validation에서 사용

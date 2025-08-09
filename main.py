@@ -7,32 +7,23 @@ import config
 import os
 import glob
 import joblib
-import utils
 from tqdm import tqdm
 # [수정] read_data와 _max_zero_run 함수를 preprocessing에서 임포트
-from preprocessing import Preprocessor, create_sliding_window_samples, read_data
+from preprocessing import Preprocessor, read_data
 from modeling import ModelTrainer
+from utils import save_submission
 from sklearn.metrics import mean_absolute_error
 
-
+# ✅ validation 추가
+from validation import (
+    WeekAlignedValidator,
+    build_week_aligned_blocks,
+    load_calendar_blocks,
+    last_5_weeks_block,
+)
+import utils  # smape
 
 def main(args):
-
-    # ++++++++++++++++++ DB 연결 필요시 +++++++++++++++
-    # engine = utils.connect_db()
-
-    # # train 불러오기
-    # sql = 'SELECT * FROM train'
-    # train = utils.db2df(engine, sql)
-
-    # # test 불러오기
-    # test_list = []
-    # for i in range(10):
-    #     sql = f'SELECT * FROM TEST_0{i}'
-    #     test = utils.db2df(engine, sql)
-    #     test_list.append(test)
-    
-    # +++++++++++++++++++++++++++++++++++++++++++++
     
     if args.mode == 'train':
         print("--- 학습 모드 시작 ---")
@@ -40,30 +31,48 @@ def main(args):
         # 1. 데이터 불러오기 및 1차 전처리
         raw_df = read_data(config.TRAIN_CSV_PATH)
         
-        preprocessor = Preprocessor(store_xy_map=config.STORE_XY, thr=config.THR)
-        processed_df = preprocessor.fit_transform(raw_df)
+        preprocessor = Preprocessor(config)
+        X_train, y_train = preprocessor.fit_transform(raw_df, is_train=True)
 
         # 2. Preprocessor 객체 저장
         os.makedirs(config.MODEL_DIR, exist_ok=True)
         joblib.dump(preprocessor, os.path.join(config.MODEL_DIR, 'preprocessor.pkl'))
         print("Preprocessor 객체가 저장되었습니다.")
         
-        # 3. 2차 전처리: Tabular 데이터셋 생성 (필터링 로직 포함)
-        X_train, y_train = create_sliding_window_samples(
-            processed_df,
-            lags=config.LAGS,
-            horizon=config.HORIZON,
-            train_mode=True,
-            thr=config.THR
-        )
 
         print(f"필터링 후 데이터 수: {len(X_train):,}")
         
-        # 4. 모델 검증, 학습 및 저장
+        # 3. 모델 검증, 학습 및 저장
         print("\n--- 모델 학습 및 검증 시작 ---")
         trainer = ModelTrainer(config.MODELS, config.MODEL_DIR)
 
+        # 3-1) 기본 holdout 검증
         trainer.validate(X_train, y_train)
+
+        # 3-2) Week-aligned 검증 (공모전 동주차 + 마지막 5주)
+        blocks = []
+        blocks += load_calendar_blocks(config)      # 공모전 동주차 (config.VAL.calendar_blocks)
+        blocks += [last_5_weeks_block(config)]      # 마지막 5주(4+1)
+        if not blocks:                              # 혹시 비어 있으면 자동 생성
+            blocks = build_week_aligned_blocks(config)
+
+        #    - 각 블록마다 새 모델을 만들기 위한 팩토리 (trainer 내부 메서드 활용)
+        factory = (lambda: trainer._get_model_instance(
+            trainer.best_model_name,
+            trainer.models[trainer.best_model_name]['model_params']
+        ))
+
+        validator = WeekAlignedValidator(
+            model_factory=factory,
+            gap_days=config.VAL.get("gap_days", 35),
+            metric=utils.smape_leaderboard,
+            progress=True
+        )
+        validator.run(X_train, y_train, blocks)
+
+        # 3-3) 최종 전체 데이터로 재학습 후 저장
+        trainer.fit_and_save(X_train, y_train)
+        # 3-3) 최종 모델 저장
         trainer.fit_and_save(X_train, y_train)
         
         print("--- 학습 모드 완료 ---")
@@ -71,34 +80,24 @@ def main(args):
     elif args.mode == 'predict':
         print("--- 예측 모드 시작 ---")
         
-        # [수정] Preprocessor 객체 로드만 수행하도록 수정
         preprocessor = joblib.load(os.path.join(config.MODEL_DIR, 'preprocessor.pkl'))
         trainer = ModelTrainer(config.MODELS, config.MODEL_DIR)
         test_files = sorted(glob.glob(os.path.join(config.TEST_DIR_PATH, '*.csv')))
         
         all_predictions_list = []
         for test_file in tqdm(test_files, desc="Test 파일별 예측 진행"):
-            # [수정] read_data 함수를 import해서 사용
             test_df = read_data(test_file)
-        # for test_df in test_list:
             
-            X_test, _ = create_sliding_window_samples(
-                preprocessor.transform(test_df),
-                lags=config.LAGS,
-                horizon=config.HORIZON,
-                train_mode=False,
-                thr=config.THR
-            )
-
-            filtered_mask = X_test['is_filtered']
-            X_predict = X_test.loc[~filtered_mask].drop(columns=['is_filtered'])
+            X_test, _ = preprocessor.transform(test_df, is_train=False)
             
-            # [수정] 모델 예측 결과가 2차원 배열이 되도록 predict 함수 수정
-            model_predictions = trainer.predict(X_predict)
+            # [수정] 필터링 로직을 제거하고 모든 test 데이터에 대해 예측 수행
+            model_predictions = trainer.predict(X_test)
             
+            # 예측값을 담을 배열 생성
             full_predictions = np.zeros((len(X_test), config.HORIZON))
-            full_predictions[~filtered_mask] = model_predictions
-            
+            full_predictions[:] = model_predictions
+            full_predictions = np.maximum(full_predictions, 1.0)
+
             rows = []
             keys_info = X_test.drop_duplicates(subset='영업장명_메뉴명').reset_index()
             
@@ -118,6 +117,7 @@ def main(args):
             all_predictions_list.append(pred_df)
 
         full_pred = pd.concat(all_predictions_list, ignore_index=True)
+        
         save_submission(full_pred)
         print("--- 예측 모드 완료 ---")
 

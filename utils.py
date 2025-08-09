@@ -71,3 +71,81 @@ def db2df(engine, sql):
 
     return df
 
+
+
+def smape(y_true, y_pred, eps=1e-9):
+    """
+    Symmetric MAPE (sMAPE)
+    - y_true, y_pred: numpy array 또는 pandas DataFrame (shape 동일)
+    - 계산식: mean( 200 * |y - ŷ| / (|y| + |ŷ|) )
+    - 분모가 0 근처일 때를 대비해 eps로 하한을 둠
+    - 반환: float (평균 sMAPE)
+    """
+
+    # DataFrame이 들어오면 값만 추출
+    if isinstance(y_true, pd.DataFrame):
+        y_true = y_true.values
+    if isinstance(y_pred, pd.DataFrame):
+        y_pred = y_pred.values
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    num = np.abs(y_true - y_pred)
+    den = np.clip(np.abs(y_true) + np.abs(y_pred), eps, None)
+
+    return float(np.mean(200.0 * num / den))
+
+def smape_point(a, p, eps=1e-9):
+    a = np.asarray(a, dtype=float)
+    p = np.asarray(p, dtype=float)
+    den = np.clip(np.abs(a) + np.abs(p), eps, None)
+    return 200.0 * np.abs(a - p) / den
+
+def smape_leaderboard(
+    X_meta: pd.DataFrame,
+    y_true,
+    y_pred,
+    store_col: str = '영업장명_메뉴명',
+    eps: float = 1e-9,
+    store_weights: dict | None = None,   # ✅ 가게별 가중치 딕셔너리
+) -> float:
+    """
+    리더보드 스타일 sMAPE (가게 가중 포함):
+      - 실제 A=0인 날짜 제외
+      - (store,item) 평균 → store 평균 → store 가중 평균
+    기본 가중치: 균등. store_weights로 개별 가중치 오버라이드 가능.
+    """
+    # 1) 가게 추출 (영업장_메뉴명 --> 영업장)
+    meta = X_meta[[store_col]].copy()
+    meta['store'] = meta[store_col].astype(str).str.split('_', n=1).str[0].str.strip()
+    meta['row_id'] = np.arange(len(meta))
+
+    # 2) y를 long으로
+    yt = pd.DataFrame(y_true).copy()
+    yp = pd.DataFrame(y_pred).copy()
+    yt['row_id'] = yp['row_id'] = np.arange(len(meta))
+    yt = yt.melt(id_vars='row_id', var_name='h', value_name='A')
+    yp = yp.melt(id_vars='row_id', var_name='h', value_name='P')
+    df = yt.merge(yp, on=['row_id','h']).merge(meta[['row_id','store',store_col]], on='row_id')
+
+    # 3) 실제=0 제외
+    df = df[df['A'] != 0].copy()
+    if df.empty:
+        return np.nan
+
+    # 4) 포인트 sMAPE
+    df['smape'] = smape_point(df['A'], df['P'], eps=eps)
+
+    # 5) 품목 → 가게 평균
+    item_mean = df.groupby(['store', store_col])['smape'].mean()
+    store_mean = item_mean.groupby('store').mean()                # index = store
+
+    # 6) ✅ 가게 가중 평균 (미라시아/담하 2x)
+    default_w = {'미라시아': 2.0, '담하': 2.0}                   # <- 원하는 가중치
+    if store_weights:                                             # 호출 시 오버라이드 가능
+        default_w.update(store_weights)
+    w = store_mean.index.to_series().map(lambda s: default_w.get(s, 1.0)).astype(float)
+
+    score = float((store_mean * w).sum() / w.sum())
+    return score
